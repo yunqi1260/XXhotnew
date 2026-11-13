@@ -8,6 +8,7 @@ import { sql, type Db } from "../db.ts";
 import { shutdownSignal } from "../lib/shutdown.ts";
 import { logError } from "../lib/log-error.ts";
 import { serverModules, type ModuleQueue } from "../modules.ts";
+import { runOwner } from "./runs.ts";
 export { shutdownSignal } from "../lib/shutdown.ts";
 
 let boss: PgBoss | null = null;
@@ -16,14 +17,14 @@ let starting: Promise<PgBoss> | null = null;
 export interface JobData {
   "content.analyze": { articleId: string; attemptTag?: string };
   "content.extract-body": { articleId: string };
-  "events.group": { articleId: string; signalOnly?: boolean };
+  "events.group": { articleId: string; signalOnly?: boolean; regroup?: boolean };
   "events.digest": { storyId: number };
   "sources.fetch": { sourceId: string; force?: boolean };
   "sources.fetch-x": { key: string; sourceIds: string[] };
   "sources.mp": { sourceId: string; reason?: "schedule" | "manual" };
   "notify.selected": { articleId: string; attempt?: number };
   "publication.republish-source": { sourceId: string };
-  "media.prepare": { articleId: string } | { url: string; mode: string };
+  "media.prepare": { articleId: string } | { url: string; mode: string; format?: "avif" };
 }
 export type QueueName = keyof JobData;
 
@@ -58,10 +59,11 @@ const QUEUE_OPTIONS: Record<QueueName, QueueOptions> = {
 
 const ensured = new Set<string>();
 
-export async function getBoss(): Promise<PgBoss> {
+/** Only the worker owns timer dispatch and queue maintenance; other processes submit work. */
+export async function getBoss({ supervise = false } = {}): Promise<PgBoss> {
   if (boss) return boss;
   starting ??= (async () => {
-    const b = new PgBoss({ connectionString: config.databaseUrl, max: 4, schema: "pgboss", application_name: "aihot-jobs" });
+    const b = new PgBoss({ connectionString: config.databaseUrl, max: 4, schema: "pgboss", application_name: "aihot-jobs", schedule: supervise, supervise });
     b.on("error", (err) => console.error("[pg-boss]", logError(err)));
     try {
       await b.start();
@@ -181,14 +183,14 @@ export async function workModuleQueues(boss: PgBoss): Promise<void> {
 // Scheduled task bookkeeping: every run leaves a row, so operators see the latest result.
 
 export async function recordRun<T>(job: string, fn: () => Promise<T>): Promise<T> {
-  const [row] = await sql<{ id: number }[]>`INSERT INTO job_runs (job) VALUES (${job}) RETURNING id`;
+  const [row] = await sql<{ id: number }[]>`INSERT INTO job_runs (job, detail) VALUES (${job}, ${sql.json({ owner: await runOwner() })}) RETURNING id`;
   try {
     const result = await fn();
-    const detail = result && typeof result === "object" ? result : { result };
-    await sql`UPDATE job_runs SET status = 'ok', finished_at = now(), detail = ${sql.json(detail as never)} WHERE id = ${row!.id}`;
+    const detail = result && typeof result === "object" && !Array.isArray(result) ? result : { result };
+    await sql`UPDATE job_runs SET status = 'ok', finished_at = now(), detail = ${sql.json(detail as never)} || jsonb_build_object('owner', detail->'owner') WHERE id = ${row!.id} AND status = 'running'`;
     return result;
   } catch (error) {
-    await sql`UPDATE job_runs SET status = 'failed', finished_at = now(), error = ${String(error).slice(0, 4000)} WHERE id = ${row!.id}`;
+    await sql`UPDATE job_runs SET status = 'failed', finished_at = now(), error = ${String(error).slice(0, 4000)} WHERE id = ${row!.id} AND status = 'running'`;
     throw error;
   }
 }
